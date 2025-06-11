@@ -1,4 +1,4 @@
-module github.com/kklab-com/goth-concurrent
+module github.com/yetiz-org/goth-concurrent
 
 go 1.18
 

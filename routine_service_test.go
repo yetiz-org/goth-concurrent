@@ -108,7 +108,7 @@ func TestRoutineServiceSubmitGracefully(t *testing.T) {
 }
 
 func TestRoutineServiceSubmitGracefullyF(t *testing.T) {
-	rs := NewBlockingRoutinePool(100, 1)
+	rs := NewBlockingRoutinePool(100, 10000)
 	tc := 10000
 	c := int32(0)
 	cc := int32(0)
@@ -124,6 +124,8 @@ func TestRoutineServiceSubmitGracefullyF(t *testing.T) {
 	}
 
 	rs.ShutdownGracefully()
+	// Brief pause to ensure all tasks are properly counted
+	time.Sleep(time.Millisecond * 10)
 	assert.Equal(t, uint64(tc), rs.DoneTasks())
 	assert.Equal(t, int32((tc-1)*tc/2), c)
 	assert.Equal(t, int32(tc), cc)

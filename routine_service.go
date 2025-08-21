@@ -73,43 +73,80 @@ type Routine interface {
 }
 
 type routine struct {
-	rs        *routines
-	shutdown  Future
-	kv        sync.Map
-	state     int
-	rid       uint32
-	doneCount uint64
+	rs         *routines
+	shutdown   Future
+	kv         sync.Map
+	state      int32    // Use int32 for atomic operations
+	rid        uint32
+	doneCount  uint64   // Already uint64 for atomic operations
+	// Performance optimization fields
+	ridCached  bool     // Whether goroutine ID is cached
+	lastActive int64    // Last activity timestamp for optimization
 }
 
+// getGoRoutineId retrieves the current goroutine ID with caching optimization.
+// This method parses the runtime stack trace to extract the goroutine ID.
+// Note: This is for debugging purposes only and should not be relied upon for correctness.
 func (r *routine) getGoRoutineId() int {
+	// Return cached ID if available
+	if r.ridCached {
+		return int(atomic.LoadUint32(&r.rid))
+	}
+	
 	var buf [64]byte
 	n := runtime.Stack(buf[:], false)
-	idField := strings.Fields(strings.TrimPrefix(string(buf[:n]), "goroutine "))[0]
-	id, err := strconv.Atoi(idField)
-	if err != nil {
-		panic(fmt.Sprintf("cannot get goroutine id: %v", err))
+	
+	// Parse "goroutine 123 [running]:" format
+	stack := string(buf[:n])
+	if !strings.HasPrefix(stack, "goroutine ") {
+		return 0 // Fallback for unexpected format
 	}
-
-	return id
+	
+	idStr := strings.Fields(strings.TrimPrefix(stack, "goroutine "))[0]
+	if id, err := strconv.Atoi(idStr); err == nil {
+		// Cache the ID for future use
+		atomic.StoreUint32(&r.rid, uint32(id))
+		r.ridCached = true
+		return id
+	}
+	
+	return 0 // Fallback if parsing fails
 }
 
 func (r *routine) run() {
 	go func(r *routine) {
+		// Initialize goroutine ID and optimization fields
 		atomic.StoreUint32(&r.rid, uint32(r.getGoRoutineId()))
+		atomic.StoreInt64(&r.lastActive, time.Now().UnixNano())
+		
+		// Use short, fixed timeout to ensure responsiveness to shutdown signals
+		// This prevents deadlock during shutdown while maintaining reasonable performance
+		const pollTimeout = time.Millisecond * 10 // Fixed 10ms timeout for responsiveness
+		
 		for !r.shutdown.IsDone() {
-			if v := r.rs.tq.PopTimeout(time.Millisecond); v == nil {
+			if v := r.rs.tq.PopTimeout(pollTimeout); v == nil {
+				// Double-check shutdown status after timeout to ensure responsiveness
 				if r.shutdown.IsDone() {
 					break
 				}
+				// Continue polling - no need for adaptive timeout since we use a fixed short timeout
 			} else {
-				r.state = gorRunning
+				// Process the task
+				atomic.StoreInt32(&r.state, gorRunning)
+				atomic.StoreInt64(&r.lastActive, time.Now().UnixNano())
+				
 				v.(*routineTask).t(r)
-				r.doneCount++
-				r.state = gorReady
+				atomic.AddUint64(&r.doneCount, 1)
+				atomic.StoreInt32(&r.state, gorReady)
+				
+				// Check shutdown status after each task to ensure quick response
+				if r.shutdown.IsDone() {
+					break
+				}
 			}
 		}
 
-		r.state = gorShutdown
+		atomic.StoreInt32(&r.state, gorShutdown)
 	}(r)
 }
 
@@ -133,6 +170,11 @@ type routines struct {
 	maxQueuedTasks int
 	tq             BlockingQueue
 	routineList    []*routine
+	// Performance optimization fields
+	cachedStandby  int32    // Cached standby routine count
+	cachedDone     uint64   // Cached done task count
+	lastStatsTime  int64    // Last statistics update time
+	statsInterval  int64    // Statistics cache interval (nanoseconds)
 }
 
 func (rs *routines) MaxRoutines() int {
@@ -140,16 +182,19 @@ func (rs *routines) MaxRoutines() int {
 }
 
 func (rs *routines) StandbyRoutines() int {
-	return func() int {
-		v := 0
-		for _, r := range rs.routineList {
-			if r.state == gorReady {
-				v++
-			}
+	// Always recalculate for accuracy
+	v := 0
+	for _, r := range rs.routineList {
+		if atomic.LoadInt32(&r.state) == gorReady {
+			v++
 		}
-
-		return v
-	}()
+	}
+	
+	// Update cache for other methods that might use it
+	atomic.StoreInt32(&rs.cachedStandby, int32(v))
+	atomic.StoreInt64(&rs.lastStatsTime, time.Now().UnixNano())
+	
+	return v
 }
 
 func (rs *routines) MaxTasks() int {
@@ -161,14 +206,23 @@ func (rs *routines) Tasks() int {
 }
 
 func (rs *routines) DoneTasks() uint64 {
-	return func() uint64 {
-		v := uint64(0)
-		for _, r := range rs.routineList {
-			v += r.doneCount
-		}
-
-		return v
-	}()
+	// Use cached value if recent enough (within 50ms)
+	now := time.Now().UnixNano()
+	if now-atomic.LoadInt64(&rs.lastStatsTime) < 50*1000*1000 { // 50ms in nanoseconds
+		return atomic.LoadUint64(&rs.cachedDone)
+	}
+	
+	// Recalculate and cache
+	v := uint64(0)
+	for _, r := range rs.routineList {
+		v += atomic.LoadUint64(&r.doneCount)
+	}
+	
+	// Update cache
+	atomic.StoreUint64(&rs.cachedDone, v)
+	atomic.StoreInt64(&rs.lastStatsTime, now)
+	
+	return v
 }
 
 func (rs *routines) buildTask(submit SubmitTask) (RoutineFuture, func(r *routine)) {
@@ -196,47 +250,62 @@ func (rs *routines) buildTask(submit SubmitTask) (RoutineFuture, func(r *routine
 }
 
 func (rs *routines) pushTask(rf RoutineFuture, task func(r *routine)) *routineTask {
-	if rs.maxQueuedTasks >= 0 {
-		for rs.tq.Len()-rs.StandbyRoutines() > rs.maxQueuedTasks {
-			if !rs.blocking {
-				rf.Completable().Fail(ErrTaskQueueFull)
-				return &routineTask{
-					f: rf,
-					t: task,
-				}
-			} else if atomic.LoadInt32(&rs.state) != gorRunning {
-				rf.Completable().Fail(ErrShutdown)
-				return &routineTask{
-					f: rf,
-					t: task,
-				}
-			}
-
-			runtime.Gosched()
-		}
-	}
-
 	rt := &routineTask{
 		f: rf,
 		t: task,
 	}
-
+	
+	// Fast path for unlimited queue
 	if rs.maxQueuedTasks < 0 {
 		rs.tq.PushTimeout(rt, time.Microsecond)
 		return rt
-	} else {
+	}
+	
+	// Check capacity with optimized calculation
+	queueLen := rs.tq.Len()
+	standbyRoutines := int(atomic.LoadInt32(&rs.cachedStandby)) // Use cached value for better performance
+	
+	if queueLen-standbyRoutines > rs.maxQueuedTasks {
 		if !rs.blocking {
-			if rs.tq.PushTimeout(rt, time.Microsecond) {
-				return rt
-			}
-
+			// Non-blocking: fail immediately
 			rf.Completable().Fail(ErrTaskQueueFull)
 			return rt
+		} else {
+			// Blocking: wait with adaptive backoff
+			backoff := time.Microsecond
+			maxBackoff := time.Millisecond
+			
+			for queueLen-rs.StandbyRoutines() > rs.maxQueuedTasks {
+				if atomic.LoadInt32(&rs.state) != gorRunning {
+					rf.Completable().Fail(ErrShutdown)
+					return rt
+				}
+				
+				time.Sleep(backoff)
+				if backoff < maxBackoff {
+					backoff *= 2
+				}
+				queueLen = rs.tq.Len()
+			}
 		}
+	}
 
-		for !rs.tq.PushTimeout(rt, time.Microsecond) && rs.state == gorRunning {
+	// Push task with appropriate timeout
+	if !rs.blocking {
+		if rs.tq.PushTimeout(rt, time.Microsecond) {
+			return rt
 		}
-
+		rf.Completable().Fail(ErrTaskQueueFull)
+		return rt
+	} else {
+		// Blocking mode: retry until success or shutdown
+		for !rs.tq.PushTimeout(rt, time.Microsecond) {
+			if atomic.LoadInt32(&rs.state) != gorRunning {
+				rf.Completable().Fail(ErrShutdown)
+				break
+			}
+			runtime.Gosched()
+		}
 		return rt
 	}
 }
@@ -253,8 +322,9 @@ func (rs *routines) IsShutdown() bool {
 	return atomic.LoadInt32(&rs.state) == gorShutdown
 }
 
-// ShutdownGracefully decline all incoming task, wait for all queued tasks done,
-// shutdown all routine then return
+// ShutdownGracefully initiates a graceful shutdown of the routine service.
+// It stops accepting new tasks, waits for all queued tasks to complete,
+// then shuts down all worker routines. This method blocks until shutdown is complete.
 func (rs *routines) ShutdownGracefully() {
 	if !atomic.CompareAndSwapInt32(&rs.state, gorRunning, gorPendingShutdown) {
 		panic(ErrShutdownTwice)
@@ -269,7 +339,7 @@ func (rs *routines) ShutdownGracefully() {
 	}
 
 	for _, r := range rs.routineList {
-		for r.state != gorShutdown {
+		for atomic.LoadInt32(&r.state) != gorShutdown {
 			runtime.Gosched()
 		}
 	}
@@ -277,8 +347,9 @@ func (rs *routines) ShutdownGracefully() {
 	atomic.StoreInt32(&rs.state, gorShutdown)
 }
 
-// ShutdownImmediately decline all incoming task, drop all queued task,
-// shutdown all routine then return
+// ShutdownImmediately initiates an immediate shutdown of the routine service.
+// It stops accepting new tasks, drops all queued tasks without processing them,
+// and shuts down all worker routines immediately. This method returns quickly.
 func (rs *routines) ShutdownImmediately() {
 	if !atomic.CompareAndSwapInt32(&rs.state, gorRunning, gorPendingShutdown) {
 		panic(ErrShutdownTwice)
@@ -298,12 +369,21 @@ func newRoutinePool(nRoutines int, maxQueuedTasks int, blocking bool) RoutineSer
 		state:          gorRunning,
 		maxRoutines:    nRoutines,
 		maxQueuedTasks: maxQueuedTasks,
+		// Initialize optimization fields
+		cachedStandby:  int32(nRoutines), // Initially all routines are standby
+		cachedDone:     0,
+		lastStatsTime:  time.Now().UnixNano(),
+		statsInterval:  10 * 1000 * 1000, // 10ms in nanoseconds
 	}
 
+	// Pre-allocate routine list for better performance
+	r.routineList = make([]*routine, 0, nRoutines)
+	
 	for i := 0; i < nRoutines; i++ {
 		rw := &routine{
-			rs:       r,
-			shutdown: NewFuture(),
+			rs:        r,
+			shutdown:  NewFuture(),
+			ridCached: false,
 		}
 
 		r.routineList = append(r.routineList, rw)
@@ -313,16 +393,26 @@ func newRoutinePool(nRoutines int, maxQueuedTasks int, blocking bool) RoutineSer
 	return r
 }
 
-// NewRoutinePool create a fix rs pool with limited task queue
-// Submit/Execute will return a FailFuture when task queue is full
-// maxQueuedTasks -1 for unlimited tasks
+// NewRoutinePool creates a fixed-size routine pool with a limited task queue.
+// When the task queue is full, Submit operations will return a failed Future immediately.
+// 
+// Parameters:
+//   - nRoutines: Number of worker routines in the pool (must be > 0)
+//   - maxQueuedTasks: Maximum number of queued tasks (-1 for unlimited capacity)
+//
+// This is ideal for scenarios where you want fast failure when the system is overloaded.
 func NewRoutinePool(nRoutines int, maxQueuedTasks int) RoutineService {
 	return newRoutinePool(nRoutines, maxQueuedTasks, false)
 }
 
-// NewBlockingRoutinePool create a fix rs pool with limited task queue
-// Submit/Execute will be blocking when task queue is full
-// maxQueuedTasks -1 for unlimited tasks
+// NewBlockingRoutinePool creates a fixed-size routine pool with a limited task queue.
+// When the task queue is full, Submit operations will block until space becomes available.
+//
+// Parameters:
+//   - nRoutines: Number of worker routines in the pool (must be > 0)  
+//   - maxQueuedTasks: Maximum number of queued tasks (-1 for unlimited capacity)
+//
+// This is ideal for scenarios where you want to apply backpressure when overloaded.
 func NewBlockingRoutinePool(nRoutines int, maxQueuedTasks int) RoutineService {
 	return newRoutinePool(nRoutines, maxQueuedTasks, true)
 }

@@ -162,24 +162,25 @@ func testConcurrentSafety(t *testing.T) {
 			
 			for j := 0; j < numOperations; j++ {
 				future := NewFuture()
+				expectedValue := id*numOperations + j
 				
 				// Add listener concurrently
-				go func() {
-					future.AddListener(&optimizationTestListener{id: id*numOperations + j})
-				}()
+				go func(val int) {
+					future.AddListener(&optimizationTestListener{id: val})
+				}(expectedValue)
 				
 				// Complete future concurrently
-				go func() {
+				go func(val int) {
 					time.Sleep(time.Millisecond)
-					success := future.Completable().Complete(id*numOperations + j)
+					success := future.Completable().Complete(val)
 					if !success {
 						errors <- &testError{msg: "completion failed"}
 					}
-				}()
+				}(expectedValue)
 				
 				// Get result
 				result := future.Get()
-				if result != id*numOperations+j {
+				if result != expectedValue {
 					errors <- &testError{msg: "wrong result"}
 				}
 			}

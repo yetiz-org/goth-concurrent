@@ -363,7 +363,7 @@ func (f *DefaultFuture) AddListener(listener FutureListener) Future {
 	defer f.release()
 	
 	// Double-check state after lock acquisition (avoid TOCTOU race)
-	if f.state != stateWait {
+	if atomic.LoadInt32(&f.state) != stateWait {
 		// Release lock before calling listener to avoid deadlock
 		f.release()
 		f.safeCallListener(listener)

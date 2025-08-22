@@ -2,7 +2,6 @@ package concurrent
 
 import (
 	"container/list"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -190,46 +189,8 @@ func (q *blockingQueue) preInit() *blockingQueue {
 }
 
 func (q *blockingQueue) qPush() {
-	// Fast path: try atomic operations first
-	if atomic.CompareAndSwapInt32(&q.spinLock, 0, 1) {
-		defer atomic.StoreInt32(&q.spinLock, 0)
-		
-		// Quick check for common case
-		lh := len(q.head)
-		lt := len(q.tail)
-		listLen := q.iq.Len()
-		
-		// Fast path for direct head channel operation
-		if lh == 0 && listLen == 0 && lt > 0 {
-			select {
-			case item := <-q.tail:
-				select {
-				case q.head <- item:
-					return // Fast path completed
-				default:
-					// Put back and fall through to slow path
-					select {
-					case q.tail <- item:
-					default:
-					}
-				}
-			default:
-			}
-		}
-		
-		// Update cached list size
-		atomic.StoreInt32(&q.lastListSize, int32(listLen))
-	} else {
-		// Spin briefly if lock is contended
-		for i := 0; i < 3; i++ {
-			if atomic.LoadInt32(&q.spinLock) == 0 {
-				break
-			}
-			runtime.Gosched()
-		}
-	}
-	
-	// Slow path: use mutex for complex operations
+	// Always use mutex for thread-safe access to internal list
+	// Remove fast path to eliminate race conditions
 	q.tc.Lock()
 	defer q.tc.Unlock()
 	
@@ -253,15 +214,6 @@ func (q *blockingQueue) TryPush(obj any) bool {
 	}
 
 	if q.isListQueue() {
-		// Fast path: try to push directly to head if possible
-		if len(q.head) == 0 && atomic.LoadInt32(&q.lastListSize) == 0 {
-			select {
-			case q.head <- obj:
-				return true
-			default:
-			}
-		}
-		
 		// Standard list queue path
 		select {
 		case q.tail <- obj:
@@ -320,32 +272,8 @@ func (q *blockingQueue) Push(obj any) {
 }
 
 func (q *blockingQueue) qPop() {
-	// Fast path: try atomic operations first
-	if atomic.CompareAndSwapInt32(&q.spinLock, 0, 1) {
-		defer atomic.StoreInt32(&q.spinLock, 0)
-		
-		// Quick check for simple case
-		lh := len(q.head)
-		listLen := q.iq.Len()
-		
-		// Fast path: if head is empty and list is empty, nothing to do
-		if lh == 0 && listLen == 0 {
-			return
-		}
-		
-		// Update cached list size
-		atomic.StoreInt32(&q.lastListSize, int32(listLen))
-	} else {
-		// Spin briefly if lock is contended
-		for i := 0; i < 3; i++ {
-			if atomic.LoadInt32(&q.spinLock) == 0 {
-				break
-			}
-			runtime.Gosched()
-		}
-	}
-	
-	// Slow path: use mutex for complex operations
+	// Always use mutex for thread-safe access to internal list
+	// Remove fast path to eliminate race conditions
 	q.tc.Lock()
 	defer q.tc.Unlock()
 	
@@ -366,10 +294,8 @@ func (q *blockingQueue) TryPop() any {
 	if q.isListQueue() {
 		select {
 		case v := <-q.head:
-			// Only call qPop if there might be more items to process
-			if atomic.LoadInt32(&q.lastListSize) > 0 || len(q.tail) > 0 {
-				q.qPop()
-			}
+			// Always call qPop to maintain consistency
+			q.qPop()
 			return v
 		default:
 			return nil
@@ -452,8 +378,9 @@ func (q *blockingQueue) Reset() {
 }
 
 func (q *blockingQueue) Len() int {
-	// Always return accurate count to ensure correctness
-	// The performance impact is minimal compared to the correctness requirement
+	// Acquire mutex to ensure thread-safe access to internal list
+	q.tc.Lock()
+	defer q.tc.Unlock()
 	return len(q.head) + q.iq.Len() + len(q.tail)
 }
 

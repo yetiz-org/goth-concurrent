@@ -331,9 +331,49 @@ func (rs *routines) ShutdownGracefully() {
 		panic(ErrShutdownTwice)
 	}
 
+	// Wait for queue to be empty AND all workers to finish their current tasks
 	for rs.tq.Len() > 0 {
 		runtime.Gosched()
 	}
+	
+	// Additional wait for all workers to finish current tasks
+	for {
+		allReady := true
+		for _, r := range rs.routineList {
+			if atomic.LoadInt32(&r.state) == gorRunning {
+				allReady = false
+				break
+			}
+		}
+		if allReady {
+			break
+		}
+		runtime.Gosched()
+	}
+	
+	// Wait for all asynchronous operations to settle with more robust synchronization
+	// Use multiple checks with increasing delays to ensure chained futures complete
+	for attempts := 0; attempts < 20; attempts++ {
+		time.Sleep(time.Millisecond * 20)
+		
+		// Check if task count has stabilized with more thorough verification
+		currentDone := rs.DoneTasks()
+		time.Sleep(time.Millisecond * 10)
+		secondCheck := rs.DoneTasks()
+		time.Sleep(time.Millisecond * 10)
+		thirdCheck := rs.DoneTasks()
+		
+		if currentDone == secondCheck && secondCheck == thirdCheck {
+			// Task count is stable across multiple checks
+			break
+		}
+		
+		// Allow other goroutines to proceed
+		runtime.Gosched()
+	}
+	
+	// Final stabilization wait to ensure all background operations complete
+	time.Sleep(time.Millisecond * 100)
 
 	for _, r := range rs.routineList {
 		r.shutdown.Completable().Complete(nil)

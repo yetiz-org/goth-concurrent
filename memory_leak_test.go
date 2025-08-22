@@ -112,7 +112,17 @@ func TestMemoryLeakMutex(t *testing.T) {
 	
 	runtime.ReadMemStats(&m2)
 	
-	allocDiff := m2.Alloc - m1.Alloc
+	// Handle potential integer overflow/underflow in memory calculation
+	var allocDiff uint64
+	if m2.Alloc >= m1.Alloc {
+		allocDiff = m2.Alloc - m1.Alloc
+	} else {
+		// If m2.Alloc < m1.Alloc, it means GC freed more memory than was allocated
+		// In this case, we consider the net memory usage as 0
+		allocDiff = 0
+		t.Logf("GC freed more memory than allocated during test - net memory usage: 0 bytes")
+	}
+	
 	t.Logf("Mutex memory used: %d bytes (%.2f MB)", allocDiff, float64(allocDiff)/1024/1024)
 	
 	// Mutex operations should use minimal memory

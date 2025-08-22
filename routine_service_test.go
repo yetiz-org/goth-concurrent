@@ -160,7 +160,7 @@ func TestRoutineServiceSubmitImmediately(t *testing.T) {
 				})
 			}
 
-			assert.GreaterOrEqual(t, int32(10000), c)
+			assert.GreaterOrEqual(t, int32(10000), atomic.LoadInt32(&c))
 			wg.Done()
 		}()
 	}
@@ -185,7 +185,7 @@ func TestRoutineServiceSubmitImmediately10000(t *testing.T) {
 			}
 
 			rs.ShutdownImmediately()
-			assert.GreaterOrEqual(t, int32(10000), c)
+			assert.GreaterOrEqual(t, int32(10000), atomic.LoadInt32(&c))
 			wg.Done()
 		}()
 	}
@@ -210,7 +210,7 @@ func TestRoutineServiceSubmitImmediatelyUnLimit(t *testing.T) {
 			}
 
 			rs.ShutdownImmediately()
-			assert.GreaterOrEqual(t, int32(10000), c)
+			assert.GreaterOrEqual(t, int32(10000), atomic.LoadInt32(&c))
 			wg.Done()
 		}()
 	}

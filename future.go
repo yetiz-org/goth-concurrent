@@ -340,7 +340,9 @@ func (f *DefaultFuture) IsFail() bool {
 	return atomic.LoadInt32(&f.state) == stateFail
 }
 
-func (f *DefaultFuture) Error() error {
+func (f *DefaultFuture) Error() (rtErr error) {
+	f.acquire()
+	defer f.release()
 	return f.err
 }
 
@@ -407,40 +409,21 @@ func (f *DefaultFuture) AddListener(listener FutureListener) Future {
 }
 
 // Complete marks this Future as successfully completed with the given result.
-// Optimized version with panic-safe locks and reduced overhead.
-func (f *DefaultFuture) Complete(obj any) bool {
-	// Fast path: try atomic swap first
-	if !atomic.CompareAndSwapInt32(&f.state, stateWait, stateSuccess) {
+func (f *DefaultFuture) Complete(obj any) (completed bool) {
+	if atomic.LoadInt32(&f.state) != stateWait {
 		return false
 	}
-	
-	// Set object with panic-safe lock handling
-	func() {
-		f.acquire()
-		defer func() {
-			f.release()
-			if r := recover(); r != nil {
-				// Panic during object setting - reset state and re-panic
-				atomic.StoreInt32(&f.state, stateWait)
-				panic(r)
-			}
-		}()
-		f.obj = obj
-	}()
-	
-	// Close channel to signal completion - panic safe
-	defer func() {
-		if r := recover(); r != nil {
-			// Channel close panic - reset state for safety
-			atomic.StoreInt32(&f.state, stateWait)
-			panic(r)
-		}
-	}()
+
+	f.acquire()
+	if !atomic.CompareAndSwapInt32(&f.state, stateWait, stateSuccess) {
+		f.release()
+		return false
+	}
+
+	f.obj = obj
+	f.release()
 	close(f.ch)
-	
-	// Call listeners WITHOUT holding any locks to avoid deadlock
 	f.callListener()
-	
 	return true
 }
 
@@ -469,44 +452,27 @@ func (f *DefaultFuture) Cancel() bool {
 }
 
 // Fail marks this Future as failed with the given error.
-// Uses panic-safe locks and avoids deadlock.
-func (f *DefaultFuture) Fail(err error) bool {
-	// Fast path: try atomic swap first
-	if !atomic.CompareAndSwapInt32(&f.state, stateWait, stateFail) {
+func (f *DefaultFuture) Fail(err error) (failed bool) {
+	if atomic.LoadInt32(&f.state) != stateWait {
 		return false
 	}
-	
-	// Set error with comprehensive panic protection
-	func() {
-		f.acquire()
-		defer func() {
-			f.release()
-			if r := recover(); r != nil {
-				// Panic during error setting - reset state and re-panic
-				atomic.StoreInt32(&f.state, stateWait)
-				panic(r)
-			}
-		}()
-		f.err = err
-	}()
-	
-	// Close channel with panic protection
-	defer func() {
-		if r := recover(); r != nil {
-			// Channel close panic - reset state for safety
-			atomic.StoreInt32(&f.state, stateWait)
-			panic(r)
-		}
-	}()
+
+	f.acquire()
+	if !atomic.CompareAndSwapInt32(&f.state, stateWait, stateFail) {
+		f.release()
+		return false
+	}
+
+	f.err = err
+	f.release()
 	close(f.ch)
-	
-	// Call listeners WITHOUT holding any locks to avoid deadlock
 	f.callListener()
-	
 	return true
 }
 
 func (f *DefaultFuture) Set(obj any) {
+	f.acquire()
+	defer f.release()
 	f.obj = obj
 }
 

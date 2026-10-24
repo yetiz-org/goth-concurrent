@@ -643,39 +643,39 @@ func TestFuture_MemoryPoolEfficiency(t *testing.T) {
 	runtime.GC()
 	var beforeStats runtime.MemStats
 	runtime.ReadMemStats(&beforeStats)
-	
+
 	// Create and complete many futures to test pool reuse
 	const numIterations = 1000
 	for i := 0; i < numIterations; i++ {
 		future := NewFuture()
-		
+
 		// Add listeners to test listener pool
 		for j := 0; j < 10; j++ {
 			future.AddListener(NewFutureListener(func(f Future) {
 				_ = f.IsDone()
 			}))
 		}
-		
+
 		future.Completable().Complete(i)
 		_ = future.Get()
-		
+
 		// Explicitly return to pool for testing
 		if df, ok := future.(*DefaultFuture); ok {
 			df.returnToPool()
 		}
 	}
-	
+
 	// Force GC and check memory usage
 	runtime.GC()
 	var afterStats runtime.MemStats
 	runtime.ReadMemStats(&afterStats)
-	
+
 	// Memory growth should be minimal due to pooling
-	memoryGrowth := afterStats.Alloc - beforeStats.Alloc
+	memoryGrowth := int64(afterStats.Alloc) - int64(beforeStats.Alloc)
 	t.Logf("Memory growth after %d futures: %d bytes", numIterations, memoryGrowth)
-	
+
 	// This is a heuristic test - in practice, good pooling should keep growth low
-	if memoryGrowth > uint64(numIterations*1000) { // 1KB per future seems reasonable upper bound
+	if memoryGrowth > int64(numIterations*1000) { // 1KB per future seems reasonable upper bound
 		t.Logf("Warning: Higher than expected memory growth - pool may not be working optimally")
 	}
 }

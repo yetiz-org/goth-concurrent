@@ -11,57 +11,57 @@ import (
 func TestMemoryLeakFuture(t *testing.T) {
 	runtime.GC()
 	runtime.GC() // Double GC to ensure clean start
-	
+
 	var m1, m2 runtime.MemStats
 	runtime.ReadMemStats(&m1)
-	
+
 	// Run intensive Future operations
 	const iterations = 10000
 	futures := make([]Future, iterations)
-	
+
 	for i := 0; i < iterations; i++ {
 		future := NewFuture()
-		
+
 		// Add multiple listeners to test memory pool
 		for j := 0; j < 5; j++ {
 			future.AddListener(NewFutureListener(func(f Future) {
 				// Simple listener that doesn't leak
 			}))
 		}
-		
+
 		// Create chains
 		chain := future.Chainable().Then(func(prev Future) any {
 			return prev.Get()
 		}).Then(func(prev Future) any {
 			return prev.Get()
 		})
-		
+
 		future.Completable().Complete(i)
 		chain.Get() // Ensure completion
-		
+
 		futures[i] = future
-		
+
 		// Periodic cleanup check
 		if i%1000 == 999 {
 			runtime.GC()
 		}
 	}
-	
+
 	// Force garbage collection
 	runtime.GC()
 	runtime.GC()
 	time.Sleep(time.Millisecond * 100) // Allow GC to complete
-	
+
 	runtime.ReadMemStats(&m2)
-	
-	allocDiff := m2.Alloc - m1.Alloc
+
+	allocDiff := int64(m2.Alloc) - int64(m1.Alloc)
 	t.Logf("Memory used: %d bytes (%.2f MB)", allocDiff, float64(allocDiff)/1024/1024)
-	
+
 	// Check for reasonable memory usage (should not exceed 50MB for this test)
 	if allocDiff > 50*1024*1024 {
 		t.Errorf("Potential memory leak detected: %d bytes allocated", allocDiff)
 	}
-	
+
 	// Verify memory pools are working
 	if allocDiff > iterations*1000 { // More than 1KB per future seems excessive
 		t.Logf("Warning: Memory usage seems high, memory pools may not be effective")
@@ -135,44 +135,44 @@ func TestMemoryLeakMutex(t *testing.T) {
 func TestMemoryLeakQueue(t *testing.T) {
 	runtime.GC()
 	runtime.GC()
-	
+
 	var m1, m2 runtime.MemStats
 	runtime.ReadMemStats(&m1)
-	
+
 	const iterations = 20000
-	
+
 	// Test different queue configurations
 	queues := []BlockingQueue{
 		NewBlockingQueue(100),
 		NewBlockingQueue(-1), // Unlimited
 		NewBlockingQueue(1000),
 	}
-	
+
 	for _, q := range queues {
 		for i := 0; i < iterations; i++ {
 			q.Push(i)
 			q.Pop()
-			
+
 			// Test timeout operations
 			q.PushTimeout(i, time.Microsecond)
 			q.PopTimeout(time.Microsecond)
-			
+
 			if i%2000 == 1999 {
 				q.Reset()
 				runtime.GC()
 			}
 		}
 	}
-	
+
 	runtime.GC()
 	runtime.GC()
 	time.Sleep(time.Millisecond * 100)
-	
+
 	runtime.ReadMemStats(&m2)
-	
-	allocDiff := m2.Alloc - m1.Alloc
+
+	allocDiff := int64(m2.Alloc) - int64(m1.Alloc)
 	t.Logf("Queue memory used: %d bytes (%.2f MB)", allocDiff, float64(allocDiff)/1024/1024)
-	
+
 	if allocDiff > 20*1024*1024 {
 		t.Errorf("Potential memory leak in Queue: %d bytes allocated", allocDiff)
 	}
@@ -182,17 +182,17 @@ func TestMemoryLeakQueue(t *testing.T) {
 func TestMemoryLeakWaitGroup(t *testing.T) {
 	runtime.GC()
 	runtime.GC()
-	
+
 	var m1, m2 runtime.MemStats
 	runtime.ReadMemStats(&m1)
-	
+
 	const iterations = 10000
 	wgs := make([]*WaitGroup, iterations)
-	
+
 	for i := 0; i < iterations; i++ {
 		wg := &WaitGroup{}
 		wgs[i] = wg
-		
+
 		// Test various operations
 		wg.Add(5)
 		go func() {
@@ -215,24 +215,24 @@ func TestMemoryLeakWaitGroup(t *testing.T) {
 			time.Sleep(time.Microsecond)
 			wg.Done()
 		}()
-		
+
 		wg.Wait()
 		wg.Reset()
-		
+
 		if i%1000 == 999 {
 			runtime.GC()
 		}
 	}
-	
+
 	runtime.GC()
 	runtime.GC()
 	time.Sleep(time.Millisecond * 100)
-	
+
 	runtime.ReadMemStats(&m2)
-	
-	allocDiff := m2.Alloc - m1.Alloc
+
+	allocDiff := int64(m2.Alloc) - int64(m1.Alloc)
 	t.Logf("WaitGroup memory used: %d bytes (%.2f MB)", allocDiff, float64(allocDiff)/1024/1024)
-	
+
 	if allocDiff > 15*1024*1024 {
 		t.Errorf("Potential memory leak in WaitGroup: %d bytes allocated", allocDiff)
 	}
@@ -242,16 +242,16 @@ func TestMemoryLeakWaitGroup(t *testing.T) {
 func TestMemoryLeakRoutineService(t *testing.T) {
 	runtime.GC()
 	runtime.GC()
-	
+
 	var m1, m2 runtime.MemStats
 	runtime.ReadMemStats(&m1)
-	
+
 	// Create routine service with larger queue to avoid blocking
 	rs := NewRoutinePool(10, 10000) // Increased queue size
-	
+
 	const iterations = 2000 // Reduced iterations to avoid long test times
 	futures := make([]RoutineFuture, iterations)
-	
+
 	for i := 0; i < iterations; i++ {
 		idx := i // Capture loop variable
 		future := rs.Submit(func(r Routine) any {
@@ -259,9 +259,9 @@ func TestMemoryLeakRoutineService(t *testing.T) {
 			runtime.Gosched()
 			return idx
 		})
-		
+
 		futures[i] = future
-		
+
 		// More frequent cleanup to prevent queue buildup
 		if i%200 == 199 {
 			// Wait for recent tasks to complete
@@ -271,23 +271,23 @@ func TestMemoryLeakRoutineService(t *testing.T) {
 			runtime.GC()
 		}
 	}
-	
+
 	// Wait for all remaining tasks to complete
 	for _, f := range futures {
 		f.Get()
 	}
-	
+
 	rs.ShutdownGracefully()
-	
+
 	runtime.GC()
 	runtime.GC()
 	time.Sleep(time.Millisecond * 100) // Reduced wait time
-	
+
 	runtime.ReadMemStats(&m2)
-	
-	allocDiff := m2.Alloc - m1.Alloc
+
+	allocDiff := int64(m2.Alloc) - int64(m1.Alloc)
 	t.Logf("RoutineService memory used: %d bytes (%.2f MB)", allocDiff, float64(allocDiff)/1024/1024)
-	
+
 	if allocDiff > 15*1024*1024 { // Adjusted threshold for fewer iterations
 		t.Errorf("Potential memory leak in RoutineService: %d bytes allocated", allocDiff)
 	}
